@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: bigdata_spark_postgres
+    environment:
+      POSTGRES_USER: bigdata
+      POSTGRES_PASSWORD: bigdata123
+      POSTGRES_DB: petstore
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./sql/01_create_raw.sql:/docker-entrypoint-initdb.d/01_create_raw.sql
+      - ./sql/02_import_raw.sql:/docker-entrypoint-initdb.d/02_import_raw.sql
+      - ./исходные данные:/data
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - spark_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bigdata -d petstore"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+    build: ./spark
+    container_name: spark_master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark-jobs
+    networks:
+      - spark_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  spark-worker:
+    build: ./spark
+    container_name: spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+    volumes:
+      - ./spark:/opt/spark-jobs
+    networks:
+      - spark_net
+    depends_on:
+      - spark-master
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: bigdata_spark_clickhouse
+    environment:
+      CLICKHOUSE_USER: bigdata
+      CLICKHOUSE_PASSWORD: bigdata123
+      CLICKHOUSE_DB: petstore_reports
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./sql/03_clickhouse_ddl.sql:/docker-entrypoint-initdb.d/03_clickhouse_ddl.sql
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - spark_net
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  spark_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  clickhouse_data:
