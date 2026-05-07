@@ -16,7 +16,7 @@ def write_pg(df, table):
 
 
 def global_rank(order_col):
-    return F.dense_rank().over(Window.orderBy(order_col))
+    return F.dense_rank().over(Window.partitionBy(F.lit(1)).orderBy(order_col))
 
 
 def main():

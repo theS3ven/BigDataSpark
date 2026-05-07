@@ -1,5 +1,4 @@
 import urllib.request
-import urllib.parse
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -15,6 +14,13 @@ PG_PROPS = {
 CH_HOST = "http://clickhouse:8123"
 CH_DB = "petstore_reports"
 CH_AUTH = "?user=bigdata&password=bigdata123"
+
+CH_JDBC_URL = "jdbc:clickhouse://clickhouse:8123/petstore_reports"
+CH_JDBC_PROPS = {
+    "user": "bigdata",
+    "password": "bigdata123",
+    "driver": "ru.yandex.clickhouse.ClickHouseDriver",
+}
 
 # Схемы таблиц: (ddl_columns, order_by)
 TABLE_DDL = {
@@ -54,7 +60,7 @@ TABLE_DDL = {
 }
 
 
-# ── ClickHouse HTTP helpers ────────────────────────────────────────────────────
+# ── ClickHouse HTTP (только DDL) ───────────────────────────────────────────────
 
 
 def ch_execute(sql):
@@ -70,48 +76,6 @@ def ch_execute(sql):
         ) from None
 
 
-def _tsv_val(v):
-    if v is None:
-        return "\\N"
-    s = str(v)
-    return (
-        s.replace("\\", "\\\\")
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
-
-
-def write_ch(df, table):
-    """DROP + CREATE + bulk-insert в ClickHouse через HTTP TabSeparated."""
-    cols_ddl, order_by = TABLE_DDL[table]
-    ch_execute(f"DROP TABLE IF EXISTS {CH_DB}.{table}")
-    ch_execute(
-        f"CREATE TABLE {CH_DB}.{table} ({cols_ddl}) "
-        f"ENGINE = MergeTree() ORDER BY ({order_by})"
-    )
-
-    rows = df.collect()
-    if not rows:
-        print(f"  -> {table}: 0 строк")
-        return
-
-    body = "\n".join("\t".join(_tsv_val(v) for v in row) for row in rows).encode(
-        "utf-8"
-    )
-    query = f"INSERT INTO {CH_DB}.{table} FORMAT TabSeparated"
-    url = CH_HOST + "/" + CH_AUTH + "&query=" + urllib.parse.quote(query)
-    req = urllib.request.Request(url, data=body, method="POST")
-    try:
-        with urllib.request.urlopen(req) as r:
-            r.read()
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse INSERT в {table} упал:\n{msg}") from None
-
-    print(f"  -> записано в {table}: {len(rows)} строк")
-
-
 # ── Spark helpers ──────────────────────────────────────────────────────────────
 
 
@@ -120,7 +84,26 @@ def read_pg(spark, table):
 
 
 def desc_rank(col):
-    return F.dense_rank().over(Window.orderBy(F.col(col).desc()))
+    return F.dense_rank().over(Window.partitionBy(F.lit(1)).orderBy(F.col(col).desc()))
+
+
+def write_ch(df, table):
+    """DROP + CREATE (MergeTree) + Spark JDBC bulk-insert в ClickHouse."""
+    cols_ddl, order_by = TABLE_DDL[table]
+    ch_execute(f"DROP TABLE IF EXISTS {CH_DB}.{table}")
+    ch_execute(
+        f"CREATE TABLE {CH_DB}.{table} ({cols_ddl}) "
+        f"ENGINE = MergeTree() ORDER BY ({order_by})"
+    )
+
+    count = df.count()
+    df.write.option("isolationLevel", "NONE").jdbc(
+        url=CH_JDBC_URL,
+        table=f"{CH_DB}.{table}",
+        mode="append",
+        properties=CH_JDBC_PROPS,
+    )
+    print(f"  -> записано в {table}: {count} строк")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -132,7 +115,7 @@ def main():
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setLogLevel("ERROR")
 
     print("Инициализируем базу данных ClickHouse...")
     ch_execute(f"CREATE DATABASE IF NOT EXISTS {CH_DB}")
@@ -148,8 +131,6 @@ def main():
     fact = fact.withColumn("total_price", F.col("total_price").cast("double"))
     dim_product = dim_product.withColumn("price", F.col("price").cast("double"))
 
-    # Заранее готовим узкие проекции dim_product для каждого отчёта,
-    # чтобы не было конфликта имён с fact_sales.quantity
     dp_sales = dim_product.select(
         "product_id", "product_name", "category", "rating", "reviews"
     )
